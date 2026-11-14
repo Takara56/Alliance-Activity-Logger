@@ -1,0 +1,8 @@
+streamlit>=1.36
+pandas
+openpyxl
+pillow
+numpy
+gspread>=6.0
+rapidocr-onnxruntime
+pytesseract
