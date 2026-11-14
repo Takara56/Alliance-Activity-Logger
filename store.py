@@ -16,6 +16,7 @@ def _from_dict(d: dict) -> L.Data:
     data.roster = {k: v for k, v in (d.get("roster") or {}).items()}
     data.attendance = {tuple(t) for t in d.get("attendance") or []}
     data.might = {(w, p): int(v) for w, p, v in d.get("might") or []}
+    data.aliases = dict(d.get("aliases") or {})
     return data
 
 
@@ -47,6 +48,7 @@ class SheetsStore:
         "Roster": ["pid", "name"],
         "Attendance": ["week", "event", "pid"],
         "Might": ["week", "pid", "might"],
+        "Aliases": ["key", "pid"],
     }
 
     def __init__(self, info: dict, sheet_id: str):
@@ -98,6 +100,7 @@ class SheetsStore:
             "Roster": sorted([p, n] for p, n in data.roster.items()),
             "Attendance": sorted([w, e, p] for w, e, p in data.attendance),
             "Might": sorted([w, p, str(v)] for (w, p), v in data.might.items()),
+            "Aliases": sorted([k, p] for k, p in data.aliases.items()),
         }
 
     def load(self) -> L.Data:
@@ -113,6 +116,7 @@ class SheetsStore:
                     data.might[(r[0], r[1])] = int(float(r[2]))
                 except ValueError:
                     continue
+            data.aliases = {r[0]: r[1] for r in tables["Aliases"] if r[0] and r[1]}
             self._last = self._tables(data)
             return data
 

@@ -8,6 +8,7 @@ import pandas as pd
 import streamlit as st
 
 import logic as L
+import mightpulse
 import ocr
 from store import LocalStore, SheetsStore
 
@@ -54,9 +55,9 @@ def get_store():
     return LocalStore("data.json"), "local"
 
 
-@st.cache_resource(show_spinner="Loading the text reader (first time only)...")
-def get_engine():
-    return ocr.load_engine()
+@st.cache_resource(show_spinner="Loading the text reader (the first time can take a minute)...")
+def get_engine(lang="default"):
+    return ocr.load_engine(lang)
 
 
 gate()
@@ -86,6 +87,13 @@ def apply(mutator, undoable=True):
         d = L.diff_data(before, fresh)
         ss.undo = None if L.diff_is_empty(d) else d
     return result
+
+
+def do_clear_all():
+    n = apply(L.clear_all_players)
+    ss.clr_all_word = ""
+    ss.staged = None
+    ss.flash = f"Cleared all {n} players with their marks and might. Use \u201cUndo the last change\u201d to bring them back."
 
 
 def shift_week(days):
@@ -134,9 +142,24 @@ with st.container(border=True):
 
     if source == "Screenshots":
         files = st.file_uploader("Screenshots", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
+        # Only two screens have a ready-made crop. Every other event reads the whole screenshot.
+        default_preset = ("alliance_power" if mode == L.MODE_MIGHT else
+                          "mobilization" if choice == "alliance-mobilization" else "none")
+        pkeys = list(ocr.PRESETS)
+        preset = st.selectbox("Screen layout", pkeys, index=pkeys.index(default_preset), key=f"preset_{choice}",
+                              format_func=lambda k: ocr.PRESETS[k][0],
+                              help="Skips the header, the pinned bottom row and extra text on screens we have seen. "
+                                   "Use Full screenshot for any other screen.")
         o1, o2, o3 = st.columns(3)
-        crop = o1.slider("Area to read, as % of image width", 0, 100, (0, 100),
-                         help="Narrow this to just the name (and might) columns to avoid reading other text.")
+        if preset == "custom":
+            crop = o1.slider("Area to read, as % of image width", 0, 100, (0, 100),
+                             help="Narrow this to just the name (and might) columns to avoid reading other text.")
+            vcrop = (0, 100)
+        elif ocr.PRESETS[preset][1]:
+            pl, pr, pt, pb = ocr.PRESETS[preset][1]
+            crop, vcrop = (pl, pr), (pt, pb)
+        else:
+            crop, vcrop = (0, 100), (0, 100)
         pick = "largest"
         if mode == L.MODE_MIGHT:
             pick = {"Largest number": "largest", "Left-most big number": "leftmost",
@@ -144,17 +167,23 @@ with st.container(border=True):
                                                                       ["Largest number", "Left-most big number",
                                                                        "Right-most big number"])]
         ignore = [w for w in o3.text_input("Words to ignore, separated by commas").split(",")]
+        q1, q2 = st.columns(2)
+        lang = q1.selectbox("Name letters", list(ocr.LANGUAGES), format_func=lambda k: ocr.LANGUAGES[k],
+                            help="Pick the script most names use. Latin helps with accents such as Turkish names.")
+        enh = q2.checkbox("Sharpen and enlarge the image first", value=False,
+                          help="Try this if names are small, blurry or low contrast.")
         if files:
-            first = ocr.crop_width(ocr.load_image(files[0]), crop[0], crop[1])
+            first = ocr.crop_area(ocr.load_image(files[0]), crop, vcrop)
             st.image(first, caption="Area that will be read (first screenshot)", width=320)
         if st.button("Read names", type="primary", disabled=not files):
-            engine = get_engine()
+            engine = get_engine(lang)
+            ss.ocr_label = engine[2]
             if engine[0] is None:
-                st.error("No text reader is installed on this server. See the README.")
+                st.error(f"No text reader could be loaded on this server. {engine[2]}")
             else:
                 rows, bar = [], st.progress(0.0, text="Reading screenshots...")
                 for i, f in enumerate(files):
-                    rows += ocr.read_image(engine, ocr.load_image(f), crop, mode, pick, ignore)
+                    rows += ocr.read_image(engine, ocr.load_image(f), crop, mode, pick, ignore, enh, vcrop, lang)
                     bar.progress((i + 1) / len(files), text=f"Read {i + 1} of {len(files)} screenshots")
                 bar.empty()
                 rows = L.dedupe_rows(rows)
@@ -203,50 +232,55 @@ with st.container(border=True):
             if not name or key in seen:
                 continue
             seen.add(key)
-            stat = L.status_text(name, data.roster) + (" · check spelling" if r.get("unsure") else "")
-            recs.append({"Include": True, "Name": name,
+            shown, stat = L.suggest(name, data.roster, data.aliases)
+            stat += " \u00b7 check spelling" if r.get("unsure") else ""
+            recs.append({"Include": True, "Read as": name, "Name": shown,
                          "Might": float(r["might"]) if r.get("might") is not None else float("nan"),
                          "Status": stat})
         ss.nonce += 1
-        ss.staged = pd.DataFrame(recs, columns=["Include", "Name", "Might", "Status"]) if recs else None
+        ss.staged = pd.DataFrame(recs, columns=["Include", "Read as", "Name", "Might", "Status"]) if recs else None
         if not recs:
             st.warning("No player names were found. Check the file or narrow the area to read.")
 
     if ss.staged is not None:
         st.subheader("Check the names")
-        st.caption("Fix any misread name, untick anyone who should not be counted, then confirm. "
-                   "Add a row at the bottom for a name that was missed.")
+        st.caption("Fix any misread name in the Name column, untick anyone who should not be counted, then confirm. "
+                   "A fix is remembered, so the same misread is corrected automatically next time. "
+                   "Add a row at the bottom for a name that was missed."
+                   + (f" Read with: {ss.ocr_label}." if ss.get("ocr_label") and source == "Screenshots" else ""))
         cfg = {
             "Include": st.column_config.CheckboxColumn("Include", default=True),
-            "Name": st.column_config.TextColumn("Name", required=True),
+            "Read as": st.column_config.TextColumn("Read as", help="What the text reader saw."),
+            "Name": st.column_config.TextColumn("Name", required=True, help="The name that will be saved. Edit it to fix a misread."),
             "Might": st.column_config.NumberColumn("Might", min_value=0, step=1, format="%d") if mode == L.MODE_MIGHT else None,
             "Status": st.column_config.TextColumn("Status"),
         }
         edited = st.data_editor(ss.staged, key=f"review-{ss.nonce}", hide_index=True, num_rows="dynamic",
-                                column_config=cfg, disabled=["Status"])
-        o1, o2 = st.columns(2)
-        merge = o1.checkbox("Treat near matches as the existing player", value=True,
-                            help="Fixes OCR slips like I versus l. Untick to add them as new players.")
-        fresh = o2.checkbox("Start fresh: replace this event's marks for the week", value=False,
+                                column_config=cfg, disabled=["Read as", "Status"])
+        fresh = st.checkbox("Start fresh: replace this event's marks for the week", value=False,
                             disabled=mode != L.MODE_ATTENDANCE)
         chosen = []
         for _, r in edited.iterrows():
             inc = True if pd.isna(r["Include"]) else bool(r["Include"])
             name = "" if pd.isna(r["Name"]) else str(r["Name"]).strip()
+            orig = "" if pd.isna(r["Read as"]) else str(r["Read as"]).strip()
             if inc and name:
-                chosen.append({"name": name, "might": None if pd.isna(r["Might"]) else int(r["Might"])})
+                chosen.append({"name": name, "orig": orig,
+                               "might": None if pd.isna(r["Might"]) else int(r["Might"])})
         label = {L.MODE_ATTENDANCE: f"Mark {len(chosen)} for {names[choice]}",
                  L.MODE_MIGHT: f"Save might for {sum(1 for c in chosen if c['might'] is not None)} players",
                  L.MODE_ROSTER: f"Add {len(chosen)} to the roster"}[mode]
         b1, b2, _ = st.columns([1, 1, 3])
         if b1.button(label, type="primary", disabled=not chosen):
             res = apply(lambda d: L.commit_rows(d, chosen, mode, choice if mode == L.MODE_ATTENDANCE else None,
-                                                wk, fresh, merge))
+                                                wk, fresh, False))
             ss.staged = None
             ss.flash = {L.MODE_ATTENDANCE: f"Marked {res['marked']} players for {names[choice]}.",
                         L.MODE_MIGHT: f"Saved might for {res['might_set']} players.",
                         L.MODE_ROSTER: "Roster updated."}[mode] + (
-                f" {res['new_players']} new on the roster." if res["new_players"] else "")
+                f" {res['new_players']} new on the roster." if res["new_players"] else "") + (
+                f" Remembered {res['learned']} corrected spelling{'s' if res['learned'] != 1 else ''}."
+                if res["learned"] else "")
             st.rerun()
         if b2.button("Discard"):
             ss.staged = None
@@ -330,6 +364,58 @@ with st.expander("Fix mistakes and manage the roster"):
         apply(lambda d: L.remove_players(d, rm))
         ss.flash = f"Removed {len(rm)} players."
         st.rerun()
+
+    st.markdown("**Player name changes**")
+    st.caption("Sync with MightPulse so every player is tied to their game ID. After that a name change keeps all "
+               "of their history and is picked up automatically on the next sync.")
+    mp_key = secret("mightpulse_key") or st.text_input("MightPulse API key", type="password", key="mp_key",
+                                                      help="Better: save it as mightpulse_key in the app secrets.")
+    s1, s2, s3 = st.columns([1, 1, 1])
+    kid = s1.text_input("Kingdom", value=str(secret("kingdom", "2159")), key="mp_kid")
+    tag = s2.text_input("Alliance tag (case-sensitive)", value=str(secret("alliance_tag", "KOR")), key="mp_tag")
+    if s3.button("Sync with MightPulse", disabled=not (mp_key and kid.strip() and tag.strip())):
+        try:
+            members = mightpulse.fetch_alliance_members(mp_key, kid, tag)
+        except mightpulse.MightPulseError as e:
+            st.error(str(e))
+        else:
+            rep = apply(lambda d: L.sync_roster(d, members, wk))
+            parts = [f"{len(members)} members read.", f"{rep['linked']} matched to existing players.",
+                     f"{rep['added']} new."]
+            if rep["renamed"]:
+                parts.append("Renamed: " + ", ".join(f"{a} \u2192 {b}" for a, b in rep["renamed"][:10]) + ".")
+            if rep["unlinked"]:
+                parts.append(f"{len(rep['unlinked'])} players are not linked to a game ID yet (listed below the merge tool).")
+            ss.flash = " ".join(parts)
+            st.rerun()
+    unl = sorted((p for p in data.roster if not p.startswith("g")), key=lambda p: data.roster[p].casefold())
+    if unl:
+        st.caption("Not linked to a game ID: " + ", ".join(data.roster[p] for p in unl[:40]) + (" ..." if len(unl) > 40 else ""))
+    g1, g2, g3 = st.columns([2, 2, 1])
+    old_p = g1.selectbox("Old name (will be removed)", [""] + list(data.roster), key="mg_old",
+                         format_func=lambda p: data.roster.get(p, "Choose..."))
+    new_p = g2.selectbox("Same player's current name (kept)", [""] + list(data.roster), key="mg_new",
+                         format_func=lambda p: data.roster.get(p, "Choose..."))
+    if g3.button("Merge", disabled=not (old_p and new_p and old_p != new_p)):
+        nm = data.roster[old_p]
+        apply(lambda d: L.merge_players(d, old_p, new_p))
+        ss.flash = f"Merged {nm} into {data.roster[new_p]}. All marks and might are combined."
+        st.rerun()
+    r1, r2, r3 = st.columns([2, 2, 1])
+    ren_p = r1.selectbox("Rename a player", [""] + list(data.roster), key="rn_p",
+                         format_func=lambda p: data.roster.get(p, "Choose..."))
+    ren_to = r2.text_input("New name", key="rn_to")
+    if r3.button("Rename", disabled=not (ren_p and ren_to.strip())):
+        apply(lambda d: L.rename_player(d, ren_p, ren_to))
+        ss.flash = "Renamed. The old spelling is remembered too."
+        st.rerun()
+
+    st.markdown("**Clear all players at once**")
+    ca1, ca2 = st.columns([3, 1])
+    ca1.text_input(f"Type DELETE to remove all {len(data.roster)} players, with their marks and might",
+                   key="clr_all_word")
+    ca2.button("Clear all players", on_click=do_clear_all,
+               disabled=not (data.roster and ss.get("clr_all_word", "").strip() == "DELETE"))
 
     st.markdown("**Events**")
     e1, e2 = st.columns([3, 1])

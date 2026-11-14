@@ -89,3 +89,29 @@ Tesseract (`tesseract-ocr`) is only needed if RapidOCR cannot be installed.
 - "The caller does not have permission" or a 403: the Google Sheet was not shared with the service account's
   `client_email` as an Editor.
 - Tests for the logic: `python -m unittest discover -s tests`.
+
+## Reading names more accurately
+
+- The app uses RapidOCR 3 with the PP-OCRv5 models (the most accurate free reader), and falls back to older RapidOCR, then Tesseract. The line "Read with: ..." above the review table tells you which one ran.
+- On the upload panel, pick **Name letters** (Latin for accents and Turkish names, Cyrillic for Russian) and tick **Sharpen and enlarge the image first** for small or blurry screenshots.
+- **Corrections are remembered.** In the review table, "Read as" is what the reader saw and "Name" is what gets saved. If you fix a misread name, the app stores the misspelling in a new **Aliases** tab of your Google Sheet and fixes it automatically next time.
+- Crop the left/right sliders to just the name column; it makes the biggest difference.
+
+## Clearing everything
+
+On the Manage tab, **Clear all players at once** (type DELETE) removes every player with their marks and might. **Undo the last change** brings them back.
+
+## Player name changes (MightPulse)
+
+1. Sign in with Discord at https://api.mightpulse.com/ and create a free API key.
+2. Add to your Streamlit secrets: `mightpulse_key = "kss_..."` (optional: `kingdom = "2159"`, `alliance_tag = "KOR"`).
+3. Manage tab > **Sync with MightPulse**. Players are matched by name the first time and tied to their game ID; after that, a rename is picked up on the next sync with all history kept.
+4. Anyone not linked (renamed before the first sync) can be folded together with **Merge**. **Rename** fixes a name by hand.
+Sync once a week before logging. The free key allows 60 requests a minute, and one sync is a single request.
+
+## Screen layouts
+
+In the upload panel, **Screen layout** picks the part of the screenshot to read. It is chosen for you:
+- **Update might (power list)** uses the Alliance Ranking layout (names and power, skipping the header and the pinned bottom row).
+- **Alliance Mobilization** uses its own layout (names only; the [KOR] tag, "Missions" lines and your pinned row are skipped).
+- **Every other event reads the whole screenshot** with no crop. Add a layout for it once you have a sample screenshot.

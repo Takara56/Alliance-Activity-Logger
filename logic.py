@@ -37,6 +37,7 @@ class Data:
     roster: Dict[str, str] = field(default_factory=dict)  # pid -> display name
     attendance: Set[Tuple[str, str, str]] = field(default_factory=set)  # (week, event_id, pid)
     might: Dict[Tuple[str, str], int] = field(default_factory=dict)  # (week, pid) -> might
+    aliases: Dict[str, str] = field(default_factory=dict)  # norm_key of a misread spelling -> pid it was corrected to
 
     def copy(self) -> "Data":
         return copy.deepcopy(self)
@@ -97,11 +98,14 @@ def lev(a: str, b: str, max_d: int) -> int:
     return prev[-1]
 
 
-def classify(name: str, roster: Dict[str, str]) -> Tuple[str, str, Optional[str]]:
+def classify(name: str, roster: Dict[str, str], aliases: Optional[Dict[str, str]] = None) -> Tuple[str, str, Optional[str]]:
     """Return (status, pid, match_pid). status is 'roster', 'close' or 'new'."""
     pid = make_pid(name)
     if pid in roster:
         return "roster", pid, pid
+    learned = (aliases or {}).get(norm_key(name))
+    if learned in roster:  # a spelling the officers corrected before
+        return "roster", learned, learned
     f = fold(norm_key(name))
     # look-alike letters already fold to the same key; real edits are only allowed on longer names so that
     # two different short names (Wolf and Wolg) are never merged by mistake
@@ -116,13 +120,19 @@ def classify(name: str, roster: Dict[str, str]) -> Tuple[str, str, Optional[str]
     return "new", pid, None
 
 
-def status_text(name: str, roster: Dict[str, str]) -> str:
-    status, _, match = classify(name, roster)
+def status_text(name: str, roster: Dict[str, str], aliases: Optional[Dict[str, str]] = None) -> str:
+    return suggest(name, roster, aliases)[1]
+
+
+def suggest(name: str, roster: Dict[str, str], aliases: Optional[Dict[str, str]] = None) -> Tuple[str, str]:
+    """Return (name to show, status text). A read that matches a roster player is shown under the roster spelling."""
+    status, pid, match = classify(name, roster, aliases)
     if status == "roster":
-        return "On roster"
+        shown = roster[match]
+        return shown, ("On roster" if make_pid(name) == match else f"Matched to {shown}")
     if status == "close":
-        return f"Looks like {roster[match]}"
-    return "New player"
+        return roster[match], f"Matched to {roster[match]} (close spelling)"
+    return name, "New player"
 
 
 # ---------------------------------------------------------------- might
@@ -252,6 +262,7 @@ class OcrItem:
 
 
 _NUM_RE = re.compile(r"^\d[\d.,\s]*[kKmMbB]?$")
+_MISSIONS_RE = re.compile(r"^\W*(missions?\b|\w{0,4}ns?:)|\d+\s*/\s*\d+\s*$", re.I)
 _RANK_RE = re.compile(r"^(no\.?|#|№)\s*\d+$", re.I)
 IGNORE_WORDS = {
     "rank", "ranking", "rankings", "name", "player", "power", "might", "score", "kills", "damage", "total",
@@ -304,7 +315,8 @@ def rows_from_items(items: List[OcrItem], mode: str = MODE_ATTENDANCE, pick: str
     for row in group_rows(items):
         names, nums = [], []
         # drop header words and rank labels first so they are never joined onto a player's name
-        row = [it for it in row if it.text.strip().lower() not in ignore_set and not _RANK_RE.match(it.text.strip())]
+        row = [it for it in row if it.text.strip().lower() not in ignore_set and not _RANK_RE.match(it.text.strip())
+               and not _MISSIONS_RE.match(it.text.strip())]
         for s in _segments(row):
             t = s["text"]
             if _NUM_RE.match(t):
@@ -354,12 +366,12 @@ def dedupe_rows(rows: List[dict]) -> List[dict]:
 
 def commit_rows(data: Data, rows: List[dict], mode: str, event_id: Optional[str], week: str,
                 fresh: bool = False, merge_close: bool = True) -> dict:
-    new_players, resolved = 0, []
+    new_players, learned, resolved = 0, 0, []
     for r in rows:
         name = clean_name(r.get("name"))
         if not name:
             continue
-        status, pid, match = classify(name, data.roster)
+        status, pid, match = classify(name, data.roster, data.aliases)
         if status == "roster":
             use = pid
         elif status == "close" and merge_close:
@@ -369,6 +381,12 @@ def commit_rows(data: Data, rows: List[dict], mode: str, event_id: Optional[str]
             data.roster[use] = name
             new_players += 1
         resolved.append((use, parse_might(r.get("might"))))
+        # remember a correction (read as X, confirmed as Y) so the same misread is fixed automatically next time
+        orig = clean_name(r.get("orig"))
+        if orig and norm_key(orig) != norm_key(data.roster[use]) and make_pid(orig) not in data.roster \
+                and data.aliases.get(norm_key(orig)) != use:
+            data.aliases[norm_key(orig)] = use
+            learned += 1
     marked = might_set = 0
     if mode == MODE_ATTENDANCE and event_id:
         if fresh:
@@ -381,7 +399,7 @@ def commit_rows(data: Data, rows: List[dict], mode: str, event_id: Optional[str]
             if m is not None:
                 data.might[(week, pid)] = m
                 might_set += 1
-    return {"new_players": new_players, "marked": marked, "might_set": might_set}
+    return {"new_players": new_players, "marked": marked, "might_set": might_set, "learned": learned}
 
 
 def diff_data(before: Data, after: Data) -> dict:
@@ -390,6 +408,8 @@ def diff_data(before: Data, after: Data) -> dict:
         if before.might.get(k) != after.might.get(k):
             might[k] = (before.might.get(k), after.might.get(k))
     return {
+        "alias_add": {k: v for k, v in after.aliases.items() if before.aliases.get(k) != v},
+        "alias_old": {k: v for k, v in before.aliases.items() if after.aliases.get(k) != v},
         "att_add": after.attendance - before.attendance,
         "att_del": before.attendance - after.attendance,
         "roster_add": {k: v for k, v in after.roster.items() if k not in before.roster},
@@ -399,7 +419,8 @@ def diff_data(before: Data, after: Data) -> dict:
 
 
 def diff_is_empty(d: dict) -> bool:
-    return not (d["att_add"] or d["att_del"] or d["roster_add"] or d["roster_del"] or d["might"])
+    return not (d["att_add"] or d["att_del"] or d["roster_add"] or d["roster_del"] or d["might"]
+                or d["alias_add"] or d["alias_old"])
 
 
 def undo_diff(data: Data, d: dict) -> None:
@@ -408,6 +429,9 @@ def undo_diff(data: Data, d: dict) -> None:
     for pid in d["roster_add"]:
         data.roster.pop(pid, None)
     data.roster.update(d["roster_del"])
+    for k in d["alias_add"]:
+        data.aliases.pop(k, None)
+    data.aliases.update(d["alias_old"])
     for key, (old, _new) in d["might"].items():
         if old is None:
             data.might.pop(key, None)
@@ -434,6 +458,77 @@ def remove_players(data: Data, pids) -> None:
         data.roster.pop(p, None)
     data.attendance = {t for t in data.attendance if t[2] not in pids}
     data.might = {k: v for k, v in data.might.items() if k[1] not in pids}
+    data.aliases = {k: v for k, v in data.aliases.items() if v not in pids}
+
+
+def clear_all_players(data: Data) -> int:
+    """Remove every player together with all of their marks, might and remembered spellings. Events stay."""
+    n = len(data.roster)
+    data.roster = {}
+    data.attendance = set()
+    data.might = {}
+    data.aliases = {}
+    return n
+
+
+def merge_players(data: Data, from_pid: str, into_pid: str) -> None:
+    """Fold one player into another (a rename that was logged as a new player). The kept player's name stays;
+    marks are combined, might is kept for weeks the kept player has none, and the old name is remembered."""
+    if from_pid == into_pid or from_pid not in data.roster or into_pid not in data.roster:
+        return
+    old_name = data.roster.pop(from_pid)
+    data.attendance = {(w, e, into_pid if p == from_pid else p) for (w, e, p) in data.attendance}
+    for (w, p), v in list(data.might.items()):
+        if p == from_pid:
+            del data.might[(w, p)]
+            data.might.setdefault((w, into_pid), v)
+    data.aliases = {k: (into_pid if v == from_pid else v) for k, v in data.aliases.items()}
+    if norm_key(old_name) != norm_key(data.roster[into_pid]):
+        data.aliases[norm_key(old_name)] = into_pid
+
+
+def rename_player(data: Data, pid: str, new_name: str) -> bool:
+    new_name = clean_name(new_name)
+    if pid not in data.roster or not new_name or data.roster[pid] == new_name:
+        return False
+    old = data.roster[pid]
+    if norm_key(old) != norm_key(new_name):
+        data.aliases[norm_key(old)] = pid
+    data.roster[pid] = new_name
+    return True
+
+
+def sync_roster(data: Data, members: List[dict], week: Optional[str] = None) -> dict:
+    """Key players by game (governor) ID. members: [{"gid","name","might"}] from MightPulse.
+    Known ID -> its name is updated (a rename). Unknown ID -> linked to the roster player with the same name
+    (keeping all history), otherwise added as new. Players that stay unlinked are listed for the officer."""
+    rep = {"renamed": [], "linked": 0, "added": 0, "might_set": 0, "unlinked": []}
+    for m in members:
+        gid, name = str(m["gid"]).strip(), clean_name(m["name"])
+        if not gid or not name:
+            continue
+        gp = "g" + gid
+        if gp in data.roster:
+            prev = data.roster[gp]
+            if rename_player(data, gp, name):
+                rep["renamed"].append((prev, name))
+        else:
+            existing = next((p for p, n in data.roster.items() if not p.startswith("g") and norm_key(n) == norm_key(name)), None)
+            if existing is None:
+                a = data.aliases.get(norm_key(name))
+                existing = a if a in data.roster and not a.startswith("g") else None
+            data.roster[gp] = name
+            if existing:
+                merge_players(data, existing, gp)
+                data.roster[gp] = name
+                rep["linked"] += 1
+            else:
+                rep["added"] += 1
+        if week and m.get("might"):
+            data.might[(week, gp)] = int(m["might"])
+            rep["might_set"] += 1
+    rep["unlinked"] = sorted(n for p, n in data.roster.items() if not p.startswith("g"))
+    return rep
 
 
 def add_event(data: Data, name: str) -> Optional[str]:
@@ -590,6 +685,7 @@ def data_to_dict(data: Data) -> dict:
         "roster": data.roster,
         "attendance": sorted([list(t) for t in data.attendance]),
         "might": sorted([[w, p, v] for (w, p), v in data.might.items()]),
+        "aliases": dict(data.aliases),
     }
 
 
@@ -651,5 +747,9 @@ def merge_backup(data: Data, text: str) -> Tuple[Optional[Data], str]:
             if key not in out.might:
                 out.might[key] = int(v)
                 might_added += 1
+    if isinstance(d.get("aliases"), dict):
+        for k, v in d["aliases"].items():
+            if isinstance(k, str) and v in remap and k not in out.aliases:
+                out.aliases[k] = remap[v]
     return out, (f"Added {added_players} player(s), {len(out.attendance) - att_before} attendance mark(s) "
                  f"and {might_added} might value(s).")

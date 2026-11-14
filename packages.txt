@@ -1,2 +1,5 @@
 libgl1
 tesseract-ocr
+tesseract-ocr-kor
+tesseract-ocr-tur
+tesseract-ocr-rus

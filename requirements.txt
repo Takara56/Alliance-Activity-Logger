@@ -4,5 +4,6 @@ openpyxl
 pillow
 numpy
 gspread>=6.0
-rapidocr-onnxruntime
+rapidocr
+onnxruntime
 pytesseract
