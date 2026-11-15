@@ -115,3 +115,15 @@ In the upload panel, **Screen layout** picks the part of the screenshot to read.
 - **Update might (power list)** uses the Alliance Ranking layout (names and power, skipping the header and the pinned bottom row).
 - **Alliance Mobilization** uses its own layout (names only; the [KOR] tag, "Missions" lines and your pinned row are skipped).
 - **Every other event reads the whole screenshot** with no crop. Add a layout for it once you have a sample screenshot.
+
+## Officers and admin
+
+Officers see only: pick the event, drop in the screenshots, check the names, confirm. Reading starts by itself as soon as the files are added, and names that are not on the roster are marked with a warning. Below that they see the week ledger and a "Made a mistake with an event?" box.
+
+Everything else (roster, player names, merge and rename, events, clear all, exports and backups, reading options) is admin only. To turn it on, add to the app secrets:
+
+    admin_password = "pick-something-different-from-app_password"
+
+Then open the small arrow at the top left of the page, open **Admin**, and enter it. Until admin_password is set, the admin tools stay locked for everyone.
+
+With `mightpulse_key` set, names and might are refreshed from MightPulse automatically (at most every 6 hours), so nobody has to press Sync.
